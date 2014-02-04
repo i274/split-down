@@ -8,6 +8,8 @@ import gflags
 import logging
 import os
 import paramiko
+import progressbar
+import signal
 import sys
 import time
 import threading
@@ -20,8 +22,9 @@ gflags.DEFINE_integer("connect_timeout", 30, "SSH connect timeout.")
 gflags.DEFINE_integer("block_timeout", 60, "Block download timeout.")
 gflags.DEFINE_integer("max_attempt", 5, "Max attempt to reconnect.")
 gflags.DEFINE_integer("blocksize", 128, "Block size in KByte.")
-gflags.DEFINE_integer("connection_per_host", 1, "Number of connections per host.")
-gflags.DEFINE_boolean("verbose", True, "Verbose mode.")
+gflags.DEFINE_integer("connection_per_host", 1, \
+                      "Number of connections per host.")
+gflags.DEFINE_boolean("verbose", False, "Verbose mode.")
 gflags.DEFINE_string("address", "", "Address list separated by comma.")
 gflags.DEFINE_boolean("compression", False, "Compression by gzip.")
 
@@ -33,6 +36,10 @@ class WrongAddressException(Exception):
 
 class NoAvailConnectionException(Exception):
   pass
+
+class RemoteErrorException(Exception):
+  def __init__(self, error):
+    self.error = error
 
 class ConnectionPool(object):
   def __init__(self, \
@@ -86,7 +93,7 @@ class ConnectionPool(object):
         conn = yield self._threadpool.submit(self._connect, address, \
                                              self._user, \
                                              self._connect_timeout)
-        log.info("<%s>: Connected." % address)
+        log.debug("<%s>: Connected." % address)
         conn.returned = False
         conn.attempt = attempt
         self.return_connection(conn)
@@ -187,10 +194,22 @@ class SplitDownloader(object):
     self._block_timeout = block_timeout
     self._resume = True
     self._compression = compression
+
     self._chunk_handlers = []
+    self._filesize_handlers = []
+    self._complete_handlers = []
 
     self._target_file = open(target, "wb")
     self._in_queue = False
+
+  def add_chunk_handler(self, handler):
+    self._chunk_handlers.append(handler)
+
+  def add_filesize_handler(self, handler):
+    self._filesize_handlers.append(handler)
+
+  def add_complete_handler(self, handler):
+    self._complete_handlers.append(handler)
 
   def _get_filesize(self, conn):
     command = "find '%s' -printf '%%s'" % self._source
@@ -219,8 +238,8 @@ class SplitDownloader(object):
     finally:
       self._connection_pool.return_connection(conn)
 
-    log.info("Downloading %s (%f MBytes.)" \
-             % (self._source, self._filesize / 1000000.))
+    for handler in self._filesize_handlers:
+      handler(self._filesize)
 
     # Makes queue.
     self._num_blocks = (self._filesize + (self._blocksize - 1)) / self._blocksize
@@ -251,9 +270,6 @@ class SplitDownloader(object):
     finally:
       self._in_queue = False
 
-  def add_chunk_handler(self, handler):
-    self._chunk_handlers.append(handler)
-
   def _download_chunks(self, channel):
     data = ""
     while True:
@@ -266,79 +282,107 @@ class SplitDownloader(object):
     return data
 
   def _download_block(self, block, conn):
-    try:
-      offset = block * self._blocksize
-      command = "xxd -p -s %d -l %d '%s' | xxd -r -p" \
-                % (offset, self._blocksize, self._source)
-      if self._compression:
-        command = command + " | gzip --best"
-      stdin, stdout, stderr = \
-        conn.exec_command(command, timeout=self._block_timeout)
-      data = self._download_chunks(stdout)
-      err = self._download_chunks(stderr)
-      if err:
-        log.error("<%s>: server error - %s" % (conn.address, err))
-        return None
-      if self._compression:
-        fileobj = StringIO.StringIO(data)
-        data = gzip.GzipFile(fileobj=fileobj).read()
-      return data
-    except Exception as e:
-      print e
-      return None
+    offset = block * self._blocksize
+    command = "xxd -p -s %d -l %d '%s' | xxd -r -p" \
+              % (offset, self._blocksize, self._source)
+    if self._compression:
+      command = command + " | gzip --best"
+    stdin, stdout, stderr = \
+      conn.exec_command(command, timeout=self._block_timeout)
+    data = self._download_chunks(stdout)
+    err = self._download_chunks(stderr)
+    if err:
+      raise RemoteErrorException(err)
+    if self._compression:
+      fileobj = StringIO.StringIO(data)
+      data = gzip.GzipFile(fileobj=fileobj).read()
+    return data
 
   @tornado.gen.coroutine
   def _on_block_downloaded(self, block, conn, future):
-    data = future.result()
-    if data:
+    try:
+      data = future.result()
       offset = block * self._blocksize
       self._target_file.seek(offset)
       self._target_file.write(data)
       self._downloaded_blocks = self._downloaded_blocks + 1
       self._connection_pool.return_connection(conn)
-
       if self._downloaded_blocks == self._num_blocks:
         self._target_file.close()
+        for handler in self._complete_handlers:
+          handler()
+        self._done.set_result(None)
+
         self._elapsed = datetime.datetime.now() - self._start_time
         print "Download complete."
         self._mbps = self._filesize / self._elapsed.total_seconds() / 1000000.
         print "Average speed: %f Mb/sec." % self._mbps
-        self._done.set_result(None)
+      raise tornado.gen.Return(None)
 
-    else:
-      self._connection_pool.report_error(conn)
-      self._queue.append(block)
-      yield self._proceed_queue()
+    except tornado.gen.Return:
+      raise
+
+    except RemoteErrorException as e:
+      log.error("<%s>: remote error - %s" % (conn.address, e.error))
+
+    except Exception as e:
+      log.warning("<%s>: %s" % (conn.address, str(e)))
+
+    self._connection_pool.report_error(conn)
+    self._queue.append(block)
+    yield self._proceed_queue()
 
 
-class BandwidthMeasurer(object):
-  def __init__(self, callback, stat_callback_period, \
+class ProgressBarCounter(progressbar.Widget):
+    __slots__ = ('format_string',)
+    def __init__(self, format='{:,}'):
+      self.format_string = format
+
+    def update(self, pbar):
+      return self.format_string.format(pbar.currval)
+
+class ProgressBarDisplay(object):
+  def __init__(self, maxval, update_period, \
                io_loop=tornado.ioloop.IOLoop.current()):
     self._lock = threading.Lock()
     self._downloaded = 0
-    self._callback = callback
     self._periodic_cb = \
-      tornado.ioloop.PeriodicCallback(self._stat, stat_callback_period, io_loop)
+      tornado.ioloop.PeriodicCallback(self._update, update_period, io_loop)
+
+    widgets = [progressbar.Percentage(), ' ',
+               progressbar.Bar(marker='=', left='[', right=']'), ' ',
+               ProgressBarCounter(), '  ',
+               progressbar.FileTransferSpeed(), '  ',
+               progressbar.ETA()]
+    self._pbar = progressbar.ProgressBar(widgets=widgets, maxval=maxval)
 
   def start(self):
+    self._pbar.start()
     self._periodic_cb.start()
 
   def stop(self):
     self._periodic_cb.stop()
+    self._pbar.finish()
 
   def handle_chunk_downloaded(self, chunk_size):
     with self._lock:
       self._downloaded = self._downloaded + chunk_size
 
-  def _stat(self):
+  def _update(self):
     with self._lock:
-      downloaded, self._downloaded = self._downloaded, 0
-    self._callback(downloaded)
+      downloaded  = self._downloaded
+    self._pbar.update(downloaded)
 
 
 def unique(l):
   assert(isinstance(l, list))
   return list(set(l))
+
+def keyboard_signal_handler(callback, signum, frame):
+  if callback:
+    callback()
+  sys.stdout.write('\n')
+  sys.exit(1)
 
 @tornado.gen.coroutine
 def main(argv=None):
@@ -351,7 +395,7 @@ def main(argv=None):
   try:
     argv = FLAGS(argv)
     if FLAGS.verbose:
-      log.setLevel(logging.DEBUG)
+      log.setLevel(logging.INFO)
     else:
       log.setLevel(logging.ERROR)
 
@@ -371,12 +415,14 @@ def main(argv=None):
     sys.exit(1)
 
   io_loop = tornado.ioloop.IOLoop.current()
+  threadpool = futures.ThreadPoolExecutor(max_workers=len(addresslist) + 5)
+  signal.signal(signal.SIGINT, \
+                functools.partial(keyboard_signal_handler, \
+                  lambda: threadpool.shutdown(False)))
 
-  print "user:",
-  ssh_id = raw_input()
+  ssh_id = raw_input("user: ")
   ssh_passwd = getpass.getpass("password: ")
 
-  threadpool = futures.ThreadPoolExecutor(max_workers=len(addresslist) + 5)
   pool = ConnectionPool(addresslist, (ssh_id, ssh_passwd), threadpool, \
                         connect_timeout=FLAGS.connect_timeout, \
                         max_attempt=FLAGS.max_attempt)
@@ -384,16 +430,23 @@ def main(argv=None):
     source, target, FLAGS.blocksize * 1024, pool, threadpool,
     compression=FLAGS.compression)
 
-  def print_bw(x):
-    print "%f mb/s" % (x / 1000000.)
-  measure = BandwidthMeasurer(print_bw, 1000)
-  downloader.add_chunk_handler(measure.handle_chunk_downloaded)
-  measure.start()
+  def on_filesize(x):
+    print "\n%s" % source
+    print "Length: %d (%.2fM)" % (x, x / (1024*1024.))
+    print "Saving to: `%s'\n" % target
+
+    pbar_display = ProgressBarDisplay(x, 100)
+    downloader.add_chunk_handler(pbar_display.handle_chunk_downloaded)
+    downloader.add_complete_handler(pbar_display.stop)
+    pbar_display.start()
+  downloader.add_filesize_handler(on_filesize)
 
   try:
     yield downloader.download()
-  except:
-    log.error("download failed.")
+  except Exception as e:
+    log.exception("download failed")
 
 if __name__ == '__main__':
+  logging.basicConfig( \
+    format="%(asctime)s <%(name)s> %(filename)s:%(lineno)d] %(message)s")
   tornado.ioloop.IOLoop.instance().run_sync(main)

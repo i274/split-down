@@ -1,0 +1,10 @@
+argparse==1.2.1
+backports.ssl-match-hostname==3.4.0.2
+distribute==0.6.24
+ecdsa==0.10
+futures==2.1.6
+paramiko==1.12.1
+pycrypto==2.6.1
+python-gflags==2.0
+tornado==3.2
+wsgiref==0.1.2

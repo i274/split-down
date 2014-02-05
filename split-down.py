@@ -38,8 +38,13 @@ class NoAvailConnectionException(Exception):
   pass
 
 class RemoteErrorException(Exception):
-  def __init__(self, error):
-    self.error = error
+  def __init__(self, err):
+    self.err = err
+  def __str__(self):
+    return repr(self.err)
+
+class NoFileException(Exception):
+  pass
 
 class ConnectionPool(object):
   def __init__(self, \
@@ -170,7 +175,7 @@ class ConnectionPool(object):
       # Do nothing.
       pass
     log.warning("Error on <%s>. reconnecting." % conn.address)
-    self.io_loop.add_callback(self._try_connect, conn.address, conn.attempt)
+    self._io_loop.add_callback(self._try_connect, conn.address, conn.attempt)
 
 
 class SplitDownloader(object):
@@ -199,7 +204,7 @@ class SplitDownloader(object):
     self._filesize_handlers = []
     self._complete_handlers = []
 
-    self._target_file = open(target, "wb")
+    self._target_file = None
     self._in_queue = False
 
   def add_chunk_handler(self, handler):
@@ -215,12 +220,18 @@ class SplitDownloader(object):
     command = "find '%s' -printf '%%s'" % self._source
     stdin, stdout, stderr = \
       conn.exec_command(command, timeout=self._block_timeout)
-    if stderr.read():
-      raise ValueError()
+    err = stderr.read()
+    if "No such file or directory" in err:
+      raise NoFileException()
+    if err:
+      raise RemoteErrorException(err)
     return int(stdout.read())
 
   @tornado.gen.coroutine
   def download(self):
+    # Opens target file.
+    self._target_file = open(self._target, "wb")
+
     # Gets filesize.
     try:
       conn = yield self._connection_pool.get_connection()
@@ -242,7 +253,8 @@ class SplitDownloader(object):
       handler(self._filesize)
 
     # Makes queue.
-    self._num_blocks = (self._filesize + (self._blocksize - 1)) / self._blocksize
+    self._num_blocks = (self._filesize + (self._blocksize - 1)) \
+                       / self._blocksize
     self._queue = range(0, self._num_blocks)
     self._queue.reverse()
 
@@ -253,6 +265,14 @@ class SplitDownloader(object):
     yield self._proceed_queue()
     yield self._done
 
+  def _check_exception(self):
+    try:
+      self._done.result(0)
+    except futures.TimeoutError:
+      pass
+    except Exception as e:
+      raise e
+
   @tornado.gen.coroutine
   def _proceed_queue(self):
     if self._in_queue:
@@ -260,6 +280,7 @@ class SplitDownloader(object):
     self._in_queue = True
     try:
       while len(self._queue) > 0:
+        self._check_exception()
         block = self._queue.pop(len(self._queue) - 1)
         conn = yield self._connection_pool.get_connection()
         self._io_loop.add_future( \
@@ -300,27 +321,11 @@ class SplitDownloader(object):
 
   @tornado.gen.coroutine
   def _on_block_downloaded(self, block, conn, future):
+    downloaded = False
     try:
       data = future.result()
-      offset = block * self._blocksize
-      self._target_file.seek(offset)
-      self._target_file.write(data)
-      self._downloaded_blocks = self._downloaded_blocks + 1
       self._connection_pool.return_connection(conn)
-      if self._downloaded_blocks == self._num_blocks:
-        self._target_file.close()
-        for handler in self._complete_handlers:
-          handler()
-        self._done.set_result(None)
-
-        self._elapsed = datetime.datetime.now() - self._start_time
-        print "Download complete."
-        self._mbps = self._filesize / self._elapsed.total_seconds() / 1000000.
-        print "Average speed: %f Mb/sec." % self._mbps
-      raise tornado.gen.Return(None)
-
-    except tornado.gen.Return:
-      raise
+      downloaded = True
 
     except RemoteErrorException as e:
       log.error("<%s>: remote error - %s" % (conn.address, e.error))
@@ -328,9 +333,35 @@ class SplitDownloader(object):
     except Exception as e:
       log.warning("<%s>: %s" % (conn.address, str(e)))
 
-    self._connection_pool.report_error(conn)
-    self._queue.append(block)
-    yield self._proceed_queue()
+    if not downloaded:
+      try:
+        self._connection_pool.report_error(conn)
+        self._queue.append(block)
+        yield self._proceed_queue()
+      except Exception as e:
+        self._done.set_exception(e)
+      return
+
+    try:
+      offset = block * self._blocksize
+      self._target_file.seek(offset)
+      self._target_file.write(data)
+      self._downloaded_blocks = self._downloaded_blocks + 1
+
+      if self._downloaded_blocks == self._num_blocks:
+        self._target_file.close()
+        for handler in self._complete_handlers:
+          handler()
+
+        self._elapsed = datetime.datetime.now() - self._start_time
+        print "Download complete."
+        self._mbps = self._filesize / self._elapsed.total_seconds() / 1000000.
+        print "Average speed: %f Mb/sec." % self._mbps
+
+        self._done.set_result(None)
+
+    except Exception as e:
+      self._done.set_exception(e)
 
 
 class ProgressBarCounter(progressbar.Widget):
@@ -443,10 +474,14 @@ def main(argv=None):
 
   try:
     yield downloader.download()
+  except NoFileException:
+    sys.stderr.write("`%s': No such file or directory\n" % source)
+  except IOError as e:
+    sys.stderr.write("%s\n" % str(e))
   except Exception as e:
     log.exception("download failed")
 
 if __name__ == '__main__':
   logging.basicConfig( \
-    format="%(asctime)s <%(name)s> %(filename)s:%(lineno)d] %(message)s")
+    format="L %(asctime)s <%(name)s> %(filename)s:%(lineno)d] %(message)s")
   tornado.ioloop.IOLoop.instance().run_sync(main)

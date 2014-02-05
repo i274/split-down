@@ -18,6 +18,9 @@ import tornado.gen
 import gzip
 import StringIO
 
+# For hack.
+import concurrent.futures.thread
+
 gflags.DEFINE_integer("connect_timeout", 30, "SSH connect timeout.")
 gflags.DEFINE_integer("block_timeout", 60, "Block download timeout.")
 gflags.DEFINE_integer("max_attempt", 5, "Max attempt to reconnect.")
@@ -445,11 +448,15 @@ def main(argv=None):
     sys.stderr.write("Try `%s --help' for more information.\n" % argv[0])
     sys.exit(1)
 
+
   io_loop = tornado.ioloop.IOLoop.current()
   threadpool = futures.ThreadPoolExecutor(max_workers=len(addresslist) + 5)
+
+  def fast_shutdown():
+    threadpool.shutdown(False)
+    concurrent.futures.thread._threads_queues = {}
   signal.signal(signal.SIGINT, \
-                functools.partial(keyboard_signal_handler, \
-                  lambda: threadpool.shutdown(False)))
+                functools.partial(keyboard_signal_handler, fast_shutdown))
 
   ssh_id = raw_input("user: ")
   ssh_passwd = getpass.getpass("password: ")
@@ -481,7 +488,10 @@ def main(argv=None):
   except Exception as e:
     log.exception("download failed")
 
+  fast_shutdown()
+
 if __name__ == '__main__':
   logging.basicConfig( \
-    format="L %(asctime)s <%(name)s> %(filename)s:%(lineno)d] %(message)s")
+    format="L %(asctime)s <%(name)s> %(filename)s:%(lineno)d] %(message)s",
+    level=logging.CRITICAL)
   tornado.ioloop.IOLoop.instance().run_sync(main)
